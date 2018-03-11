@@ -32,8 +32,8 @@ function TabList(props) {
 TabList.prototype = {
   _setupListeners() {
     // Tab events
-    browser.tabs.onActivated.addListener(({tabId}) => this._onBrowserTabActivated(tabId));
     browser.tabs.onCreated.addListener(tab => this._create(tab));
+    browser.tabs.onActivated.addListener(({tabId}) => this._onBrowserTabActivated(tabId));
     browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) =>
                                        this._onBrowserTabUpdated(tabId, changeInfo, tab));
     browser.tabs.onRemoved.addListener(tabId => this._remove(tabId));
@@ -78,23 +78,57 @@ TabList.prototype = {
     this._maybeShrinkTabs();
   },
   _onBrowserTabActivated(tabId) {
-    this._setActive(tabId);
-    this._maybeUpdateTabThumbnail(tabId);
-    this._scrollToTab(tabId);
+    const sidetab = this._getTabById(tabId);
+    if (!sidetab) { // Could be null because of hidden tabs!
+      return;
+    }
+    this._setActive(sidetab);
+    this._maybeUpdateTabThumbnail(sidetab);
+    sidetab.scrollIntoView();
   },
   _onBrowserTabMoved(tabId, moveInfo) {
-    this._setPos(tabId, moveInfo.fromIndex < moveInfo.toIndex ?
-                       moveInfo.toIndex + 1: moveInfo.toIndex
-    );
-    this._scrollToTab(tabId);
+    const sidetab = this._getTabById(tabId);
+    if (!sidetab) { // Could be null because of hidden tabs!
+      return;
+    }
+    const allTabs = [...this._tabs.values()];
+    const {fromIndex, toIndex} = moveInfo;
+    const direction = fromIndex < toIndex ? -1 : 1;
+    // Move the other tabs indexes in response first.
+    let toMove;
+    if (direction > 0) { // Tab going up.
+      toMove = allTabs.filter(tab => tab.index < fromIndex && tab.index >= toIndex)
+    } else { // Tab going down.
+      toMove = allTabs.filter(tab => tab.index > fromIndex && tab.index <= toIndex)
+    }
+    for (const tab of toMove) {
+      tab.index += direction;
+    }
+    sidetab.index = toIndex;
+    this._appendTab(sidetab);
+    sidetab.scrollIntoView();
   },
   _onBrowserTabUpdated(tabId, changeInfo, tab) {
-    const sidetab = this._getTab(tab);
-    if (!sidetab) {
-      return; // Tab not in the current window or destroyed.
+    if (!this._checkWindow(tab)) {
+      return;
     }
-    sidetab.onUpdate(changeInfo);
+    const sidetab = this._getTabById(tab.id);
 
+    if (!sidetab) {
+      if (changeInfo.hasOwnProperty("hidden") &&
+          !changeInfo.hidden) {
+        // This tab just got visible, let's show it.
+        browser.tabs.get(tabId).then((tab) => {
+          this._create(tab, false);
+        });
+      }
+      return;
+    }
+    if (changeInfo.hidden) {
+      return this._remove(tabId);
+    }
+
+    sidetab.onUpdate(changeInfo);
     if (changeInfo.hasOwnProperty("pinned")) {
       this._onTabPinned(sidetab, tab);
     }
@@ -140,17 +174,17 @@ TabList.prototype = {
       onClose: this._onContextMenuHidden.bind(this),
       canMoveToNewWindow: this._tabs.size > 1,
       reloadAllTabs: this._reloadAllTabs.bind(this),
-      closeTabsUnderneath: this._closeTabsUnderneath.bind(this, tabId),
+      closeTabsAfter: this._closeTabsAfter.bind(this, tab.index),
       closeOtherTabs: this._closeAllTabsExcept.bind(this, tabId),
       canUndoCloseTab: this._hasRecentlyClosedTabs.bind(this),
       undoCloseTab: this._undoCloseTab.bind(this)
     });
     this._contextMenu.show();
   },
-  _closeTabsUnderneath(tabId) {
-    const tabPos = this._getPos(tabId);
-    const orderedIds = [...SideTab.getAllTabsViews()].map(el => SideTab.tabIdForView(el));
-    const toClose = orderedIds.slice(tabPos + 1).filter(id => this._tabs.get(id).visible);
+  _closeTabsAfter(tabIndex) {
+    const toClose = [...this._tabs.values()]
+                    .filter(tab => tab.index > tabIndex)
+                    .map(tab => tab.id);
     browser.tabs.remove(toClose);
   },
   _closeAllTabsExcept(tabId) {
@@ -279,10 +313,10 @@ TabList.prototype = {
       return;
     }
 
-    let curTabPos = this._getPos(tabId);
-    let dropTabPos = this._getPos(dropTabId);
+    let curTabPos = curTab.index;
+    let dropTabPos = dropTab.index;
     let newPos = curTabPos < dropTabPos ? Math.min(this._tabs.size, dropTabPos) :
-    Math.max(0, dropTabPos);
+                                          Math.max(0, dropTabPos);
     browser.tabs.move(tabId, {index: newPos});
   },
   _onSpacerDblClick() {
@@ -300,6 +334,7 @@ TabList.prototype = {
   },
   async _moveTabToBottom(tab) {
     let sameCategoryTabs = await browser.tabs.query({
+      hidden: false,
       pinned: tab.pinned,
       windowId: this._windowId
     });
@@ -308,6 +343,7 @@ TabList.prototype = {
   },
   async _moveTabToTop(tab) {
     let sameCategoryTabs = await browser.tabs.query({
+      hidden: false,
       pinned: tab.pinned,
       windowId: this._windowId
     });
@@ -348,30 +384,30 @@ TabList.prototype = {
     if (windowId && this._windowId === null) {
       this._windowId = windowId;
     }
-    const tabs = await browser.tabs.query({windowId});
+    const tabs = await browser.tabs.query({windowId, hidden: false});
     // Sort the tabs by index so we can insert them in sequence.
     tabs.sort((a, b) => a.index - b.index);
     const pinnedFragment = document.createDocumentFragment();
     const unpinnedFragment = document.createDocumentFragment();
+    let activeTab;
     for (let tab of tabs) {
       const sidetab = this.__create(tab);
+      if (tab.active) {
+        activeTab = sidetab;
+      }
       let fragment = tab.pinned ? pinnedFragment : unpinnedFragment;
       fragment.appendChild(sidetab.view);
     }
     this._pinnedview.appendChild(pinnedFragment);
     this._view.appendChild(unpinnedFragment);
     this._maybeShrinkTabs();
-    this._maybeUpdateTabThumbnail(this._active);
-    this._scrollToTab(this._active);
+    if (activeTab) {
+      this._maybeUpdateTabThumbnail(activeTab);
+      activeTab.scrollIntoView();
+    }
   },
   _checkWindow(tab) {
     return (tab.windowId === this._windowId);
-  },
-  _getTab(tab) {
-    if (this._checkWindow(tab)) {
-      return this._getTabById(tab.id);
-    }
-    return null;
   },
   _getTabById(tabId) {
     return this._tabs.get(tabId, null);
@@ -443,95 +479,81 @@ TabList.prototype = {
     this._tabs.set(tabInfo.id, tab);
     tab.init(tabInfo);
     if (tabInfo.active) {
-      this._setActive(tab.id);
+      this._setActive(tab);
     }
     return tab;
   },
-  _create(tabInfo) {
-    if (!this._checkWindow(tabInfo)) {
+  _create(tabInfo, scrollTo = true) {
+    if (!this._checkWindow(tabInfo) || tabInfo.hidden) {
       return;
     }
     this._clearSearch();
 
-    this.__create(tabInfo);
-    this._setPos(tabInfo.id, tabInfo.index);
+    const sidetab = this.__create(tabInfo);
+    this._appendTab(sidetab);
 
     this._maybeShrinkTabs();
-    this._scrollToTab(tabInfo.id);
-  },
-  _setActive(tabId) {
-    let sidetab = this._getTabById(tabId);
-    if (!sidetab) { // It's probably in another window
-      return;
+    if (scrollTo) {
+      sidetab.scrollIntoView();
     }
+  },
+  _setActive(sidetab) {
     if (this._active) {
       this._getTabById(this._active).updateActive(false);
     }
     sidetab.updateActive(true);
-    this._active = tabId;
-  },
-  _scrollToTab(tabId) {
-    const sidetab = this._getTabById(tabId);
-    if (sidetab) {
-      sidetab.scrollIntoView();
-    }
+    this._active = sidetab.id;
   },
   _remove(tabId) {
     if (this._active === tabId) {
       this._active = null;
     }
     let sidetab = this._getTabById(tabId);
-    if (!sidetab) {
+    if (!sidetab) { // Could be null because of hidden tabs!
       return;
     }
     sidetab.view.remove();
     this._tabs.delete(tabId);
     this._maybeShrinkTabs();
   },
-  _getPos(tabId) {
-    let sidetab = this._getTabById(tabId);
-    if (!sidetab) {
-      return;
-    }
-    let orderedIds = [...SideTab.getAllTabsViews()].map(el => SideTab.tabIdForView(el));
-    return orderedIds.indexOf(sidetab.id);
-  },
-  _setPos(tabId, pos) {
-    pos = parseInt(pos);
-    let sidetab = this._getTabById(tabId);
-    if (!sidetab) {
-      return;
-    }
+  _appendTab(sidetab) {
     let element = sidetab.view;
     let parent = sidetab.pinned ? this._pinnedview : this._view;
-    let elements = SideTab.getAllTabsViews();
     // Can happen with browser.tabs.closeWindowWithLastTab set to true or during
     // session restore.
-    if (!elements.length) {
+    if (!this._tabs.size) {
       parent.appendChild(element);
       return;
     }
-    let nextSibling = elements[pos];
-    if (!nextSibling || (nextSibling.parentElement !== parent)) {
-      nextSibling = elements[pos-1].nextSibling;
+    const allTabs = [...this._tabs.values()]
+                    .filter(tab => tab.pinned === sidetab.pinned)
+                    .sort((a, b) => a.index - b.index);
+    const tabAfter = allTabs.find(tab => tab.index > sidetab.index);
+    if (!tabAfter) {
+      parent.appendChild(element);
+      return;
     }
-    parent.insertBefore(element, nextSibling);
+    parent.insertBefore(element, tabAfter.view);
   },
   _onTabPinned(sidetab, tab) {
     if (tab.pinned && this._compactPins) {
       sidetab.resetThumbnail();
     }
-    let newView = tab.pinned ? this._pinnedview : this._view;
-    newView.appendChild(sidetab.view);
-    this._setPos(tab.id, tab.index);
+
+    sidetab.index = tab.index; // The index has changed, reconcile our model.
+    // Move the other tabs indexes in response first.
+    [...this._tabs.values()]
+      .filter(tab => tab.index >= sidetab.index)
+      .forEach(tab => tab.index += 1);
+    this._appendTab(sidetab);
+
     this._maybeShrinkTabs();
   },
-  _maybeUpdateTabThumbnail(tabId) {
+  _maybeUpdateTabThumbnail(sidetab) {
     if (this._compactModeMode === COMPACT_MODE_STRICT) {
       return;
     }
-    let sidetab = this._getTabById(tabId);
-    if (!sidetab || (sidetab.pinned && this._compactPins)) {
+    if (sidetab.pinned && this._compactPins) {
       return;
     }
     sidetab.updateThumbnail();
