@@ -22,6 +22,10 @@ SideTab.prototype = {
     if (tabInfo.favIconUrl) {
       this._setIcon(tabInfo.favIconUrl);
     }
+    // Check if this tab is hidden in FF59
+    if (tabInfo.hasOwnProperty("hidden")) {
+      this.updateVisibility(!tabInfo.hidden);
+    }    
     this._updatePinned(tabInfo.pinned);
     this._updateDiscarded(tabInfo.discarded);
     if (tabInfo.cookieStoreId) {
